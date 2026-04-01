@@ -20,8 +20,11 @@ from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 
-
 from . import mdp
+
+from test.config.threshold import THRESHOLD_CFG
+
+
 
 ##
 # Pre-defined configs
@@ -43,6 +46,9 @@ class TestSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type = "generator",
+        terrain_generator = THRESHOLD_CFG,
+        # max_init_terrain_level = 5,
+        collision_group = -1,
     )
 
     # lights
