@@ -19,8 +19,10 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 
 from . import mdp
+
 
 from test.config.threshold import THRESHOLD_CFG
 
@@ -42,13 +44,25 @@ from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
 class TestSceneCfg(InteractiveSceneCfg):
     """Configuration for a cart-pole scene."""
 
-    # 地形
+    # terrain
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type = "generator",
         terrain_generator = THRESHOLD_CFG,
         # max_init_terrain_level = 5,
         collision_group = -1,
+        physics_material = sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode = "multiply", 
+            restitution_combine_mode = "multiply", 
+            static_friction = 1.0,
+            dynamic_friction = 1.0,
+        ),
+        visual_material = sim_utils.MdlFileCfg(
+            mdl_path = f"/home/robot/Projects/nvidia/isaacsim_assets/Assets/Isaac/5.1/Isaac/IsaacLab/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            project_uvw = True,
+            texture_scale = (0.25, 0.25)
+        ),
+        debug_vis = False
     )
 
     # lights
@@ -59,6 +73,20 @@ class TestSceneCfg(InteractiveSceneCfg):
 
     # robot
     robot: ArticulationCfg = MISSING
+
+    # sensor
+    height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
+    )
+    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    
+
+
 
 
 
