@@ -9,6 +9,7 @@ from dataclasses import MISSING
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -121,19 +122,30 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP."""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
 
-        # observation terms (order preserved)
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity,
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
+        actions = ObsTerm(func=mdp.last_action)
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+            clip=(-1.0, 1.0),
+        )
 
-        def __post_init__(self) -> None:
-            self.enable_corruption = False
-            self.concatenate_terms = True
+        def __post_init__(self):
+            self.enable_corruption = True # 训练时对带噪声的观测项实际施加噪声
+            self.concatenate_terms = True # 将组内的观测项拼接成一个大向量输出
 
     # observation groups
     policy: PolicyCfg = PolicyCfg()
@@ -143,67 +155,148 @@ class ObservationsCfg:
 class EventCfg:
     """Configuration for events."""
 
-    # reset
-    reset_cart_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
+    '''
+        startup 仿真启动时执行一次
+    ''' 
+    # 随机化所有刚体的摩擦系数
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-            "position_range": (-1.0, 1.0),
-            "velocity_range": (-0.5, 0.5),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.8, 0.8),
+            "dynamic_friction_range": (0.6, 0.6),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+   
+    # 在 base 上随机增减质量，模拟负载变化
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "mass_distribution_params": (-5.0, 5.0),
+            "operation": "add",
         },
     )
 
-    reset_pole_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
+    # 随机偏移 base 的质心位置，模拟质量分布不均
+    base_com = EventTerm(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)},
+        },
+    )
+
+    '''
+       reset 每次 episode 重置时执行
+    '''
+    # 随机化施加持续的恒定外力/外力矩（当前范围均为 0，相当于已关闭，保留接口）
+    base_external_force_torque = EventTerm(
+        func=mdp.apply_external_force_torque,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
-            "position_range": (-0.25 * math.pi, 0.25 * math.pi),
-            "velocity_range": (-0.25 * math.pi, 0.25 * math.pi),
+            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "force_range": (0.0, 0.0),
+            "torque_range": (-0.0, 0.0),
         },
+    )
+
+    # 随机化机器人基座的初始位姿和初始速度，防止策略只学会从固定起点恢复
+    reset_base = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "velocity_range": {
+                "x": (-0.5, 0.5),
+                "y": (-0.5, 0.5),
+                "z": (-0.5, 0.5),
+                "roll": (-0.5, 0.5),
+                "pitch": (-0.5, 0.5),
+                "yaw": (-0.5, 0.5),
+            },
+        },
+    )
+
+    # 按比例随机化关节初始位置，初始速度为 0，防止策略依赖固定的初始姿态
+    reset_robot_joints = EventTerm(
+        func=mdp.reset_joints_by_scale,
+        mode="reset",
+        params={
+            "position_range": (0.5, 1.5),
+            "velocity_range": (0.0, 0.0),
+        },
+    )
+
+    '''
+        interval 训练过程中周期性触发
+    '''
+    # 每 10~15 秒随机推一次机器人
+    push_robot = EventTerm(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(10.0, 15.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
     )
 
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
 
-    # (1) Constant running reward
-    alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    # (2) Failure penalty
-    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    # (3) Primary task: keep pole upright
-    pole_pos = RewTerm(
-        func=mdp.joint_pos_target_l2,
+    # -- task
+    track_lin_vel_xy_exp = RewTerm( 
+        func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    ) # 鼓励机器人跟踪指令里的平面线速度
+    track_ang_vel_z_exp = RewTerm( 
+        func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    ) # 鼓励跟踪指令里的偏航角速度
+    # -- penalties
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0) # 惩罚竖直方向速度，避免上下
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05) # 惩罚 roll/pitch 角速度，避免机身晃动过大
+    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5) #惩罚关节力矩过大，降低能耗/暴力控制
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7) # 惩罚关节加速度过大，减少冲击
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01) # 惩罚动作变化过快，鼓励平滑控制
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time,
+        weight=0.125,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "threshold": 0.5,
+        },
+    ) # 鼓励足部有一定的空中时间，避免一直贴地滑行
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
         weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]), "target": 0.0},
-    )
-    # (4) Shaping tasks: lower cart velocity
-    cart_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"])},
-    )
-    # (5) Shaping tasks: lower pole angular velocity
-    pole_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.005,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
-    )
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*THIGH"), "threshold": 1.0},
+    ) # 惩罚不希望的接触，避免机器人与环境中的障碍物发生不必要的接触
+   
+    # -- optional penalties
+    # 惩罚机身姿态偏离“水平”的程度
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
+    # 惩罚关节位置接近或超过关节极限
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+
 
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
 
-    # (1) Time out
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # (2) Cart out of bounds
-    cart_out_of_bounds = DoneTerm(
-        func=mdp.joint_pos_out_of_manual_limit,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-3.0, 3.0)},
+    base_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     )
+
+@configclass
+class CurriculumCfg:
+    # 动态调整地形难度，增加训练环境的多样性，提升策略的鲁棒性
+    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
 
 
 ##
@@ -213,24 +306,60 @@ class TerminationsCfg:
 
 @configclass
 class TestEnvCfg(ManagerBasedRLEnvCfg):
-    # Scene settings
+
     scene: TestSceneCfg = TestSceneCfg(num_envs=4096, env_spacing=4.0)
-    # Basic settings
+
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
+    commands: CommandsCfg = CommandsCfg()
+
     events: EventCfg = EventCfg()
-    # MDP settings
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
-    # Post initialization
     def __post_init__(self) -> None:
-        """Post initialization."""
-        # general settings
-        self.decimation = 2
-        self.episode_length_s = 5
-        # viewer settings
-        self.viewer.eye = (8.0, 0.0, 5.0)
+
+        self.decimation = 4 # 每4个物理步长输出一次动作
+        self.episode_length_s = 20.0
+
         # simulation settings
-        self.sim.dt = 1 / 120
+        self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
+        self.sim.physics_material = self.scene.terrain.physics_material
+        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        
+        # update sensor update periods
+        # we tick all the sensors based on the smallest update period (physics update period)
+        if self.scene.height_scanner is not None:
+            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+        if self.scene.contact_forces is not None:
+            self.scene.contact_forces.update_period = self.sim.dt
+
+        # check if terrain levels curriculum is enabled - if so, enable curriculum for terrain generator
+        # this generates terrains with increasing difficulty and is useful for training
+        if getattr(self.curriculum, "terrain_levels", None) is not None:
+            if self.scene.terrain.terrain_generator is not None:
+                self.scene.terrain.terrain_generator.curriculum = True
+        else:
+            if self.scene.terrain.terrain_generator is not None:
+                self.scene.terrain.terrain_generator.curriculum = False
+
+
+
+# 设置控制频率和回合时长
+# decimation = 4：策略每 4 个物理步才输出一次动作（动作频率更低，物理仿真频率更高）。
+# episode_length_s = 20.0：每个 episode 最长 20 秒。
+# 设置仿真底层参数
+# sim.dt = 0.005：物理步长 5ms（即 200Hz 物理更新）。
+# sim.render_interval = decimation：渲染频率跟动作频率对齐，减少渲染开销。
+# sim.physics_material = scene.terrain.physics_material：仿真全局物理材质跟地形材质一致（摩擦等参数统一）。
+# gpu_max_rigid_patch_count = 10 * 2**15：提高 GPU 物理接触 patch 上限，避免并行环境多接触时溢出或性能问题。
+# 设置传感器更新周期
+# 高度扫描器：update_period = decimation * dt = 0.02s（50Hz），和策略动作频率一致。
+# 接触传感器：update_period = dt = 0.005s（200Hz），保持高频接触检测。
+# 目的：把“慢传感器”和“快传感器”分开，兼顾效率和稳定性。
+# 根据是否启用课程学习，开关地形课程
+# 如果存在 curriculum.terrain_levels，就把地形生成器的 curriculum 设为 True（难度递进）。
+# 否则设为 False（固定难度）。
+# 作用：让同一套代码能通过课程项是否存在来自动切换“课程训练/非课程训练”。
