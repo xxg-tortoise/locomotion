@@ -321,23 +321,18 @@ class TestEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self) -> None:
 
         self.decimation = 4 # 每4个物理步长输出一次动作
-        self.episode_length_s = 20.0
+        self.episode_length_s = 20.0 
 
-        # simulation settings
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15 # 提高 GPU 物理接触 patch 上限，避免并行环境多接触时溢出或性能问题
         
-        # update sensor update periods
-        # we tick all the sensors based on the smallest update period (physics update period)
         if self.scene.height_scanner is not None:
             self.scene.height_scanner.update_period = self.decimation * self.sim.dt
         if self.scene.contact_forces is not None:
             self.scene.contact_forces.update_period = self.sim.dt
 
-        # check if terrain levels curriculum is enabled - if so, enable curriculum for terrain generator
-        # this generates terrains with increasing difficulty and is useful for training
         if getattr(self.curriculum, "terrain_levels", None) is not None:
             if self.scene.terrain.terrain_generator is not None:
                 self.scene.terrain.terrain_generator.curriculum = True
@@ -345,21 +340,3 @@ class TestEnvCfg(ManagerBasedRLEnvCfg):
             if self.scene.terrain.terrain_generator is not None:
                 self.scene.terrain.terrain_generator.curriculum = False
 
-
-
-# 设置控制频率和回合时长
-# decimation = 4：策略每 4 个物理步才输出一次动作（动作频率更低，物理仿真频率更高）。
-# episode_length_s = 20.0：每个 episode 最长 20 秒。
-# 设置仿真底层参数
-# sim.dt = 0.005：物理步长 5ms（即 200Hz 物理更新）。
-# sim.render_interval = decimation：渲染频率跟动作频率对齐，减少渲染开销。
-# sim.physics_material = scene.terrain.physics_material：仿真全局物理材质跟地形材质一致（摩擦等参数统一）。
-# gpu_max_rigid_patch_count = 10 * 2**15：提高 GPU 物理接触 patch 上限，避免并行环境多接触时溢出或性能问题。
-# 设置传感器更新周期
-# 高度扫描器：update_period = decimation * dt = 0.02s（50Hz），和策略动作频率一致。
-# 接触传感器：update_period = dt = 0.005s（200Hz），保持高频接触检测。
-# 目的：把“慢传感器”和“快传感器”分开，兼顾效率和稳定性。
-# 根据是否启用课程学习，开关地形课程
-# 如果存在 curriculum.terrain_levels，就把地形生成器的 curriculum 设为 True（难度递进）。
-# 否则设为 False（固定难度）。
-# 作用：让同一套代码能通过课程项是否存在来自动切换“课程训练/非课程训练”。
