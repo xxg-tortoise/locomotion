@@ -135,6 +135,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    terrain = getattr(env.unwrapped.scene, "terrain", None)
+    terrain_levels = getattr(terrain, "terrain_levels", None)
+    if terrain_levels is not None:
+        unique_levels, counts = torch.unique(terrain_levels.cpu(), return_counts=True)
+        level_summary = ", ".join(
+            f"level {int(level)}: {int(count)} envs" for level, count in zip(unique_levels.tolist(), counts.tolist())
+        )
+        print(f"[INFO] Initial terrain levels: {level_summary}")
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
