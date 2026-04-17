@@ -97,13 +97,5 @@ THRESHOLD_CFG = TerrainGeneratorCfg(
 
 "Extreme Parkour with Legged Robots" (Cheng et al., 2024, CoRL) — CMU 的工作，训练四足机器人做跑酷（跳跃障碍、跨过屏障）。使用 teacher-student 框架 + 特权信息蒸馏，teacher 能访问精确地形信息，student 只用本体感知。其中明确使用了 foot clearance reward 和 stumble penalty。
 
-论文: https://extreme-parkour.github.io/
-"Robot Parkour Learning" (Zhuang et al., 2023, CoRL) — 类似的 parkour 框架，包含翻越箱子、跨越间隙等。也用了 teacher-student + 视觉。
-
-"Walk These Ways: Tuning Robot Control Commands with Large Language Models" (Margolis & Agrawal, 2023) — 提出了 gait-conditioned policy，用步态参数（频率、相位、swing height）作为命令，可以直接控制抬腿高度，非常适合你的需求。
-
-"DreamWaQ: Learning Robust Locomotion Over Risky Terrains" (Nahrendra et al., 2023) — 使用 implicit terrain estimation（隐式地形编码），不需要显式高度图，也能学会在复杂地形上自适应步态。
 
 "Agile But Safe: Learning Collision-Free High-Speed Legged Locomotion" (He et al., 2024, RSS) — 关注在高速运动中避免碰撞，有 explicit contact avoidance reward 的设计。
-
-"Learning Quadrupedal Locomotion over Challenging Terrain" (Lee et al., 2020, Science Robotics) — ETH 的经典工作，使用 curriculum + height map + 特权学习，是 Isaac Lab rough locomotion 的理论基础。
