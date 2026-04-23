@@ -1,11 +1,13 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
 
 import numpy as np
 import trimesh
 
 from isaaclab.terrains.trimesh.utils import make_border
-from .mesh_base_cfg import MeshTianziTerrainCfg
 
+if TYPE_CHECKING:
+    from .mesh_base_cfg import MeshTianziTerrainCfg
 
 def _resolve_int(value_range: tuple[int, int], difficulty: float) -> int:
     lower, upper = value_range
