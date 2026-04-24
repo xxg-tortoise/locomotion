@@ -262,6 +262,17 @@ class RewardsCfg:
             "threshold": 0.5,
         },
     ) # 鼓励足部有一定的空中时间，避免一直贴地滑行
+    foot_clearance = RewTerm(
+        func=mdp.foot_clearance,
+        weight=0.075,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "target_height": 0.12,
+            "std": 0.05,
+        },
+    ) # 在摆动相奖励足端抬到合适高度，减少擦碰障碍
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,

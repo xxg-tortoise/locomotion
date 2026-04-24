@@ -23,6 +23,9 @@ class MeshTianziTerrainCfg(SubTerrainBaseCfg):
     # 梁宽度范围
     beam_width_range: tuple[float, float] = MISSING
 
+    # 子地形内部留白宽度，用于在相邻 env 之间留出平坦间隔
+    border_width: float = 0.0
+
     # 是否添加外框
     add_outer_frame: bool = True
 
