@@ -24,7 +24,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
-from .terrains.threshold import THRESHOLD_CFG
+from .terrains.threshold import TIANZI_CFG
 
 
 
@@ -41,7 +41,7 @@ class TestSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type = "generator",
-        terrain_generator = THRESHOLD_CFG,
+        terrain_generator = TIANZI_CFG,
         # max_init_terrain_level = 5,
         collision_group = -1,
         physics_material = sim_utils.RigidBodyMaterialCfg(
@@ -248,7 +248,7 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     ) # 鼓励跟踪指令里的偏航角速度
     # -- penalties
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0) # 惩罚竖直方向速度，避免上下
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0) # 惩罚竖直方向速度，避免上下
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05) # 惩罚 roll/pitch 角速度，避免机身晃动过大
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5) #惩罚关节力矩过大，降低能耗/暴力控制
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7) # 惩罚关节加速度过大，减少冲击
@@ -267,17 +267,36 @@ class RewardsCfg:
         weight=0.075,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*FOOT"),
             "command_name": "base_velocity",
-            "target_height": 0.12,
+            "clearance_margin": 0.04,
             "std": 0.05,
+            "obstacle_threshold": 0.02,
+            "look_ahead_distance": 0.6,
         },
-    ) # 在摆动相奖励足端抬到合适高度，减少擦碰障碍
+    ) # 在摆动相奖励足端越过前方检测到的障碍高度，减少拖脚和无意义高抬腿
+    stumble_penalty = RewTerm(
+        func=mdp.stumble_penalty,
+        weight=-0.5,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "horizontal_force_threshold": 1.0,
+            "horizontal_to_vertical_ratio": 4.0,
+            "air_time_threshold": 0.05,
+        },
+    ) # 惩罚摆动相前摆脚撞到障碍，减少门槛前的绊脚和试探式乱蹭
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-1.0,
+        weight=-0.75,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*THIGH"), "threshold": 1.0},
     ) # 惩罚不希望的接触，避免机器人与环境中的障碍物发生不必要的接触
+    undesired_shank_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-0.25,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*SHANK"), "threshold": 1.0},
+    ) # 额外惩罚小腿擦碰障碍，避免只抬脚尖不抬小腿
    
     # -- optional penalties
     # 惩罚机身姿态偏离“水平”的程度
