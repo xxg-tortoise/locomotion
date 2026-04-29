@@ -248,7 +248,7 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     ) # 鼓励跟踪指令里的偏航角速度
     # -- penalties
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0) # 惩罚竖直方向速度，避免上下
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0) # 惩罚竖直方向速度，避免上下
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05) # 惩罚 roll/pitch 角速度，避免机身晃动过大
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5) #惩罚关节力矩过大，降低能耗/暴力控制
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7) # 惩罚关节加速度过大，减少冲击
@@ -259,12 +259,14 @@ class RewardsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
-            "threshold": 0.5,
+            "threshold": 0.4,
+            # "threshold": 0.5,
         },
     ) # 鼓励足部有一定的空中时间，避免一直贴地滑行
     foot_clearance = RewTerm(
         func=mdp.foot_clearance,
-        weight=0.075,
+        # weight=0.075,
+        weight=0.05,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -278,7 +280,8 @@ class RewardsCfg:
     ) # 在摆动相奖励足端越过前方检测到的障碍高度，减少拖脚和无意义高抬腿
     stumble_penalty = RewTerm(
         func=mdp.stumble_penalty,
-        weight=-0.5,
+        weight=-0.3,
+        # weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
@@ -312,7 +315,7 @@ class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     base_contact = DoneTerm(
         func=mdp.illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 0.5},
     )
 
 @configclass
