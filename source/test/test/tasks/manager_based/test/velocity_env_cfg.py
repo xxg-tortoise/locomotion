@@ -24,7 +24,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from . import mdp
-from .terrains.threshold import TIANZI_CFG
+from .terrains.threshold import Terrain_custom_cfg
 
 
 
@@ -41,8 +41,8 @@ class TestSceneCfg(InteractiveSceneCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type = "generator",
-        terrain_generator = TIANZI_CFG,
-        # max_init_terrain_level = 5,
+        terrain_generator = Terrain_custom_cfg,
+        max_init_terrain_level = 2,
         collision_group = -1,
         physics_material = sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode = "multiply", 
@@ -255,7 +255,7 @@ class RewardsCfg:
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01) # 惩罚动作变化过快，鼓励平滑控制
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
-        weight=0.125,
+        weight=0.06,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
@@ -292,7 +292,7 @@ class RewardsCfg:
     ) # 惩罚摆动相前摆脚撞到障碍，减少门槛前的绊脚和试探式乱蹭
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.75,
+        weight=-0.5,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*THIGH"), "threshold": 1.0},
     ) # 惩罚不希望的接触，避免机器人与环境中的障碍物发生不必要的接触
     undesired_shank_contacts = RewTerm(

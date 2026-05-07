@@ -36,10 +36,12 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0, # Critic loss 权重
         use_clipped_value_loss=True, 
         clip_param=0.2, # PPO 裁剪范围，限制策略更新幅度
-        entropy_coef=0.005, # 熵正则系数，鼓励探索
+        entropy_coef=0.003, # 续训，降低探索
+        # entropy_coef=0.005, # 熵正则系数，鼓励探索
         num_learning_epochs=5, # 每批数据重复训练 5 遍
         num_mini_batches=4, # 每遍分 4 个 mini-batch
-        learning_rate=1.0e-3, # 初始学习率
+        learning_rate=5.0e-4, # 续训学习率
+        # learning_rate=1.0e-3, # 初始学习率
         schedule="adaptive", # 根据 KL 散度自动调整学习率
         gamma=0.99, # 折扣因子，关注长期回报
         lam=0.95, # GAE λ，平衡 bias/variance

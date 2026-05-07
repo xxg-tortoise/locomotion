@@ -65,7 +65,7 @@ from isaaclab.assets import AssetBase
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.terrains import FlatPatchSamplingCfg, TerrainImporter, TerrainImporterCfg
 from isaaclab.terrains import TerrainGeneratorCfg
-from test.tasks.manager_based.test.terrains.threshold import TIANZI_CFG
+from test.tasks.manager_based.test.terrains.threshold import Terrain_custom_cfg
 
 
 
@@ -77,7 +77,7 @@ def design_scene() -> tuple[dict, torch.Tensor]:
     cfg.func("/World/Light", cfg)
 
     # Parse terrain generation
-    terrain_gen_cfg = TIANZI_CFG
+    terrain_gen_cfg = Terrain_custom_cfg
 
     # Add flat patch configuration
     # Note: To have separate colors for each sub-terrain type, we set the flat patch sampling configuration name
