@@ -181,8 +181,20 @@ Terrain_custom_stage4_cfg = _build_multi_terrain_cfg(
 )
 
 
+Terrain_custom_stage0_cfg = _build_multi_terrain_cfg(
+    threshold_proportion=1.0,
+    pyramid_stairs_proportion=0.0,
+    pyramid_stairs_inv_proportion=0.0,
+    boxes_proportion=0.0,
+    random_rough_proportion=0.0,
+    hf_pyramid_slope_proportion=0.0,
+    hf_pyramid_slope_inv_proportion=0.0,
+    difficulty_range=(0.0, 1.0),
+)
+
+
 # 默认先从第一阶段续训，稳定后再把这行切到 stage2 / stage3 / stage4。
-Terrain_custom_cfg = Terrain_custom_stage1_cfg
+Terrain_custom_cfg = Terrain_custom_stage0_cfg
 
 
 

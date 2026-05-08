@@ -4,10 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Evaluate a trained RSL-RL checkpoint on task-level metrics."""
+from __future__ import annotations
 
 """Launch Isaac Sim Simulator first."""
-
-from __future__ import annotations
 
 import argparse
 import json
@@ -99,7 +98,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
             return
     elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        checkpoint_arg = args_cli.checkpoint
+        if os.path.isabs(checkpoint_arg) or os.path.dirname(checkpoint_arg) or "://" in checkpoint_arg:
+            resume_path = retrieve_file_path(checkpoint_arg)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, checkpoint_arg)
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
@@ -203,7 +206,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         total_ang_vel_error += (episode_ang_vel_error[selected_ids] / step_count).sum().item()
         total_time_outs += int(base_env.reset_time_outs[selected_ids].sum().item())
         total_base_contacts += int(base_contact_term[selected_ids].sum().item())
+        previous_finished_episodes = finished_episodes
         finished_episodes += take
+
+        for completed_episodes in range(previous_finished_episodes + 1, finished_episodes + 1):
+            print(
+                f"[INFO] Eval progress: {completed_episodes}/{args_cli.num_episodes} episodes completed",
+                flush=True,
+            )
 
         episode_return[done_env_ids] = 0.0
         episode_steps[done_env_ids] = 0
