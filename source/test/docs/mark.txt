@@ -1,0 +1,106 @@
+我先把当前训练配置和仓库里已经记录过的续训/奖励经验对上，给你一个更有针对性的建议，而不是泛泛说“多调参”。
+
+Read [](file:///home/robot/Projects/xxg/locomotion/test/source/test/test/tasks/manager_based/test/agents/rsl_rl_ppo_cfg.py)
+
+Read memory [](file:///home/robot/.config/Code/User/workspaceStorage/023bd80c56e792d37cc7c11525d3059e/GitHub.copilot-chat/memory-tool/memories/repo/training_resume.md)
+
+Read memory [](file:///home/robot/.config/Code/User/workspaceStorage/023bd80c56e792d37cc7c11525d3059e/GitHub.copilot-chat/memory-tool/memories/repo/resume_terrain_mismatch.md)
+
+Read memory [](file:///home/robot/.config/Code/User/workspaceStorage/023bd80c56e792d37cc7c11525d3059e/GitHub.copilot-chat/memory-tool/memories/repo/reward_patterns.md)
+
+我再补两处本仓库里已经写过的针对性经验：一处是环境配置旁边的调参注释，一处是门槛地形分阶段泛化配置。这样建议会更贴近你现在这套代码。
+
+Read [](file:///home/robot/Projects/xxg/locomotion/test/source/test/test/tasks/manager_based/test/test_env_cfg.py)
+
+Read [](file:///home/robot/Projects/xxg/locomotion/test/source/test/test/tasks/manager_based/test/terrains/threshold.py#120-120), lines 120 to 205
+
+Read [](file:///home/robot/Projects/xxg/locomotion/test/source/test/test/tasks/manager_based/test/velocity_env_cfg.py#240-240), lines 240 to 320
+
+我再确认一下训练时到底开了哪些扰动和观测，这决定你现在该先补课程学习，还是先收敛动作质量。
+
+Read [](file:///home/robot/Projects/xxg/locomotion/test/source/test/test/tasks/manager_based/test/velocity_env_cfg.py#90-90), lines 90 to 210
+
+Searched for regex `push_robot|base_external_force_torque|enable_corruption|heading_command|resampling_time_range` (`**/source/test/test/tasks/manager_based/test/velocity_env_cfg.py`), 5 results
+
+还有一个关键点是训练期是不是在同时学“抗推”和“过障”，我把 push 配置补完。
+
+Read [](file:///home/robot/Projects/xxg/locomotion/test/source/test/test/tasks/manager_based/test/velocity_env_cfg.py#210-210), lines 210 to 245
+
+我最后补一眼仓库里关于 distillation 的记录，看它是不是已经预留了“先用特权信息学会，再压到学生策略”的路线，这也是现在很常见的做法。
+
+Read memory [](file:///home/robot/.config/Code/User/workspaceStorage/023bd80c56e792d37cc7c11525d3059e/GitHub.copilot-chat/memory-tool/memories/repo/distillation_findings.md)
+
+**判断**
+
+- 如果你看的是整体过障，72% 的 overall crossing 在“纯门槛、但还是全难度随机”的设置下，不算完全不能用。
+- 如果你看的是你真正想要的动作质量，也就是 direct clear，12.5% 确实偏低。这说明策略学会了“能过去”，但还没学会“干净地一步跨过去”。
+- 所以你的直觉是对的：如果现在就直接混更多地形，成功率大概率会掉。不是因为你做错了什么，而是因为母技能还没收紧。
+
+**为什么现在会这样**
+
+- 你的策略其实已经能“看到”前方地形了，因为 policy 观测里已经有 height scan，在 velocity_env_cfg.py 和 velocity_env_cfg.py。所以核心问题更像是目标设计和课程学习，不是单纯“感知不到障碍”。
+- 当前奖励更像是在鼓励“总体能过”，而不是显式鼓励“直接跨过”。在 velocity_env_cfg.py 往后，foot_clearance 是 0.05，stumble_penalty 是 -0.3，undesired_shank_contacts 是 -0.25，但没有一项直接奖励“无小腿碰撞且不踩顶面地完成跨越”。这种情况下，策略很容易学成保守的 climb over。
+- 你现在让策略同时学的东西有点多。命令范围在 velocity_env_cfg.py 到 velocity_env_cfg.py 是全向的，x、y、yaw 都放到 ±1，而且还开了 heading command。对新手最常见的问题就是：过障母技能还没成型，就在学转向、侧移和复杂速度跟踪。
+- 训练期还开了观测噪声和周期性推搡，在 velocity_env_cfg.py 和 velocity_env_cfg.py。主流做法一般不是一开始就把“学会过障”和“学会抗扰动”绑死在一起。
+- 你虽然现在是纯门槛地形，但当前默认其实是 stage0，也就是 100% threshold 且 difficulty range 直接拉满，在 threshold.py。这也不算“简单版门槛”。
+
+**主流做法**
+
+- 主流不是一上来就追求“单个 PPO 同时学会技能、稳态、抗扰动和泛化”。更常见的是分阶段：
+- 第一阶段是 skill acquisition。先把一个核心技能学出来，比如前向一步过门槛。
+- 第二阶段是 behavior refinement。开始压动作质量，比如减少 shank hit、减少 top-step、提高 direct clear。
+- 第三阶段是 robustness。再加回噪声、推搡、质量扰动、命令范围。
+- 第四阶段才是 generalization。逐步混别的地形，而且会保留一部分原始门槛作为 anchor。
+
+对于更难的越障任务，当前很主流的路线还有两类：
+
+- 特权学习或 asymmetric actor-critic。teacher 或 critic 看到更完整的地形信息，actor 看到简化观测。
+- teacher-student distillation。先让 teacher 学会，再把动作习惯蒸馏给 student。你这个仓库本身已经预留了这条路，见仓库里的 distillation 记录和 runner 支持。
+
+**我对你当前工程的建议**
+
+1. 先别急着混地形。你现在最需要的是先把门槛母技能打磨出来，而不是立刻追泛化。
+
+2. 先做一个更温和的“纯门槛课程”，而不是直接用当前这个全难度 stage0。最实际的是加三个阶段：
+   - threshold easy：只保留门槛，但把 difficulty 压低。
+   - threshold medium：中等难度。
+   - threshold hard：再拉到接近现在。
+   你仓库里已经有混合地形的 stage1 到 stage4，在 threshold.py 往后；我会建议你在这之前再加一套 threshold-only easy/medium/hard。
+
+3. 把命令也做课程学习。现在全向命令太宽了。主流做法通常是：
+   - 先只练前进过障，x 为正，小范围。
+   - 把 y 速度先压小，yaw 也压小，甚至先关掉 heading command。
+   - 等前向 direct clear 稳了，再逐步放开横向和转向。
+   你现在这套命令设置对一个还没学会门槛母技能的策略来说偏难。
+
+4. 训练早期先把抗扰动任务降下来。对当前阶段，我会优先：
+   - 暂时关掉 push_robot。
+   - 适度减弱观测腐蚀。
+   - 保留必要的 reset randomization，但别让策略同时对付太多外界变化。
+   这是很常见的做法，不是“作弊”，而是把 skill learning 和 robustness training 解耦。
+
+5. 奖励上要更明确地对齐目标。你现在的 reward 是“别撞、抬脚、别绊”，但没有明确奖励“直接跨过”。所以建议方向是：
+   - 前期先别加太硬的稀疏成功奖励，不然 PPO 容易学不动。
+   - 先用你现在写好的评估指标做外部标尺。
+   - 当 overall crossing 已经比较稳时，再轻量加入 direct-clear 事件奖励，或者轻量惩罚 top-step-first。
+   - 这一步要晚一点做，不然很容易把“能过去”也一起打没。
+
+6. PPO 这边先小改，不要多旋钮一起拧。你当前在 rsl_rl_ppo_cfg.py 的设置不算离谱。对你这种情况，更常见的顺序是：
+   - 先把 entropy 再降一点，比如 0.001 到 0.002，帮助动作收紧。
+   - 如果训练波动大，再把 rollout horizon 拉长一点，比如把 num_steps_per_env 从 32 再往上提。
+   - 观测归一化是次一级杠杆，不是现在第一刀。
+
+7. 混地形时一定渐进，不要突然切分布。你仓库自己已经有过一次 terrain distribution mismatch 的坑。等门槛技能稳了，再从 stage1 开始混，而不是直接大杂烩。混的时候保留门槛锚点是主流做法，这一点你在 threshold.py 往后的设计方向是对的。
+
+**一个更现实的短期目标**
+
+不要把目标定成“下个阶段直接泛化后还 70%+”。更现实的顺序是：
+
+- 先把纯门槛上的 overall crossing 做到 85% 到 90% 左右。
+- 同时让 direct clear 至少爬到 30% 到 40%，并且 shank-hit share 明显下降。
+- 然后再谈混地形。
+
+如果现在 direct clear 只有 12.5%，我不会建议你立刻进泛化阶段。先把门槛这个母技能收紧，后面会轻松很多。
+
+1. 我可以下一步直接帮你列一份“最小改动版训练路线图”，具体到先改哪几个参数、每一阶段用什么目标。
+2. 我也可以专门看你的 reward，给你设计一版更贴合 direct clear 的事件奖励方案。
