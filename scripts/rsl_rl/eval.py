@@ -174,6 +174,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     reward_names = list(base_env.reward_manager.active_terms)
     reward_indices = {name: idx for idx, name in enumerate(reward_names)}
     reward_weights = {name: base_env.reward_manager.get_term_cfg(name).weight for name in reward_names}
+    termination_names = list(getattr(base_env.termination_manager, "active_terms", ()))
 
     obstacle_metrics_enabled = all(
         key in reward_indices for key in ("foot_clearance", "undesired_shank_contacts")
@@ -203,16 +204,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         attempt_start_xy = torch.zeros(base_env.num_envs, 2, device=base_env.device)
         attempt_forward_dir = torch.zeros(base_env.num_envs, 2, device=base_env.device)
         attempt_required_progress = torch.zeros(base_env.num_envs, device=base_env.device)
+
+        # 这些计数先按 episode 暂存，只有 episode 真正被纳入评估结果时才汇总到总计，
+        # 这样可以避免最后一批并行环境超出目标 episode 数时把多余数据算进去。
         episode_obstacle_attempts = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
         episode_successful_crossings = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
+        episode_direct_clear_successes = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
+        episode_shank_hit_first_attempts = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
+        episode_shank_hit_first_successes = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
+        episode_top_step_first_attempts = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
+        episode_top_step_first_successes = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
         world_forward_axis = torch.tensor([1.0, 0.0, 0.0], device=base_env.device)
 
         total_obstacle_attempts = 0
         total_obstacle_successes = 0
         total_obstacle_failures = 0
         total_direct_clear_successes = 0
-        total_shank_hit_attempts = 0
-        total_shank_hit_successes = 0
+        total_shank_hit_first_attempts = 0
+        total_shank_hit_first_successes = 0
         total_top_step_first_attempts = 0
         total_top_step_first_successes = 0
         total_episode_obstacle_attempts = 0
@@ -239,6 +248,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     episode_shank_contact = torch.zeros(base_env.num_envs, device=base_env.device)
     episode_lin_vel_error = torch.zeros(base_env.num_envs, device=base_env.device)
     episode_ang_vel_error = torch.zeros(base_env.num_envs, device=base_env.device)
+    episode_reward_term_sums = torch.zeros(base_env.num_envs, len(reward_names), device=base_env.device)
 
     finished_episodes = 0
     total_return = 0.0
@@ -250,7 +260,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     total_ang_vel_error = 0.0
     total_time_outs = 0
     total_base_contacts = 0
-    log_metric_totals: defaultdict[str, float] = defaultdict(float)
+    reward_term_episode_means: defaultdict[str, float] = defaultdict(float)
+    termination_term_totals: defaultdict[str, float] = defaultdict(float)
 
     def recover_unweighted_term(term_name: str) -> torch.Tensor:
         if term_name not in reward_indices:
@@ -274,6 +285,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         episode_return += rewards
         episode_steps += 1
+        episode_reward_term_sums += base_env.reward_manager._step_reward
         episode_stumble += recover_unweighted_term("stumble_penalty")
         episode_thigh_contact += recover_unweighted_term("undesired_contacts")
         episode_shank_contact += recover_unweighted_term("undesired_shank_contacts")
@@ -295,7 +307,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             moving_forward = command[:, 0] > forward_command_threshold
             new_attempts = (~attempt_active) & obstacle_present & moving_forward
             if torch.any(new_attempts):
-                total_obstacle_attempts += int(new_attempts.sum().item())
                 episode_obstacle_attempts[new_attempts] += 1
                 attempt_active[new_attempts] = True
                 attempt_has_shank_hit[new_attempts] = False
@@ -310,8 +321,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 attempt_required_progress[new_attempts] = nearest_obstacle_distance[new_attempts] + obstacle_clear_margin
 
             shank_contact_now = recover_unweighted_term("undesired_shank_contacts") > 0.0
-            new_shank_hit = attempt_active & shank_contact_now & ~attempt_has_shank_hit
-            total_shank_hit_attempts += int(new_shank_hit.sum().item())
             attempt_has_shank_hit |= attempt_active & shank_contact_now
 
             foot_first_contact = contact_sensor.compute_first_contact(base_env.step_dt)[:, foot_sensor_cfg.body_ids]
@@ -329,9 +338,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             top_step_now = torch.any(foot_on_top_now, dim=1)
 
             new_shank_first = attempt_active & (attempt_strategy == 0) & shank_contact_now
+            episode_shank_hit_first_attempts[new_shank_first] += 1
             attempt_strategy[new_shank_first] = 1
             new_top_step_first = attempt_active & (attempt_strategy == 0) & (~shank_contact_now) & top_step_now
-            total_top_step_first_attempts += int(new_top_step_first.sum().item())
+            episode_top_step_first_attempts[new_top_step_first] += 1
             attempt_strategy[new_top_step_first] = 2
 
             progress_along_attempt = torch.sum(
@@ -344,13 +354,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             successful_crossings = attempt_active & (attempt_clear_steps >= obstacle_clear_steps_required)
 
             if torch.any(successful_crossings):
-                total_obstacle_successes += int(successful_crossings.sum().item())
                 episode_successful_crossings[successful_crossings] += 1
-                total_direct_clear_successes += int(
-                    (successful_crossings & (~attempt_has_shank_hit) & (attempt_strategy == 0)).sum().item()
-                )
-                total_shank_hit_successes += int((successful_crossings & attempt_has_shank_hit).sum().item())
-                total_top_step_first_successes += int((successful_crossings & (attempt_strategy == 2)).sum().item())
+                direct_clear_successes = successful_crossings & (attempt_strategy == 0)
+                shank_hit_first_successes = successful_crossings & (attempt_strategy == 1)
+                top_step_first_successes = successful_crossings & (attempt_strategy == 2)
+
+                episode_direct_clear_successes[direct_clear_successes] += 1
+                episode_shank_hit_first_successes[shank_hit_first_successes] += 1
+                episode_top_step_first_successes[top_step_first_successes] += 1
                 reset_attempt_state(successful_crossings.nonzero(as_tuple=False).squeeze(-1))
 
         done_env_ids = (base_env.reset_terminated | base_env.reset_time_outs).nonzero(as_tuple=False).squeeze(-1)
@@ -358,17 +369,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if num_done == 0:
             continue
 
-        log_info = base_env.extras.get("log", {})
-        for key, value in log_info.items():
-            if key.startswith("Episode_Reward/") or key.startswith("Episode_Termination/"):
-                log_metric_totals[key] += float(value) * num_done
-
         base_contact_term = base_env.termination_manager.get_term("base_contact")
         remaining = args_cli.num_episodes - finished_episodes
         take = min(num_done, remaining)
         selected_ids = done_env_ids[:take]
 
         step_count = episode_steps[selected_ids].clamp(min=1).float()
+        reward_term_mean_per_episode = episode_reward_term_sums[selected_ids] / step_count.unsqueeze(1)
+
         total_return += episode_return[selected_ids].sum().item()
         total_episode_length_s += (step_count * base_env.step_dt).sum().item()
         total_stumble += episode_stumble[selected_ids].sum().item()
@@ -378,9 +386,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         total_ang_vel_error += (episode_ang_vel_error[selected_ids] / step_count).sum().item()
         total_time_outs += int(base_env.reset_time_outs[selected_ids].sum().item())
         total_base_contacts += int(base_contact_term[selected_ids].sum().item())
+        for reward_idx, reward_name in enumerate(reward_names):
+            reward_term_episode_means[reward_name] += reward_term_mean_per_episode[:, reward_idx].sum().item()
+        for termination_name in termination_names:
+            if termination_name == "time_out":
+                termination_values = base_env.reset_time_outs[selected_ids].float()
+            else:
+                termination_values = base_env.termination_manager.get_term(termination_name)[selected_ids].float()
+            termination_term_totals[termination_name] += termination_values.sum().item()
         if obstacle_metrics_enabled:
+            total_obstacle_attempts += int(episode_obstacle_attempts[selected_ids].sum().item())
+            total_obstacle_successes += int(episode_successful_crossings[selected_ids].sum().item())
+            total_direct_clear_successes += int(episode_direct_clear_successes[selected_ids].sum().item())
+            total_shank_hit_first_attempts += int(episode_shank_hit_first_attempts[selected_ids].sum().item())
+            total_shank_hit_first_successes += int(episode_shank_hit_first_successes[selected_ids].sum().item())
+            total_top_step_first_attempts += int(episode_top_step_first_attempts[selected_ids].sum().item())
+            total_top_step_first_successes += int(episode_top_step_first_successes[selected_ids].sum().item())
             total_episode_obstacle_attempts += int(episode_obstacle_attempts[selected_ids].sum().item())
             total_episode_successful_crossings += int(episode_successful_crossings[selected_ids].sum().item())
+
+            # 走到 episode 结束仍未完成清障的 attempt，统一记为失败，
+            # 且只统计本次真正纳入评估结果的 selected_ids，避免尾批次 spillover。
             failed_attempts = selected_ids[attempt_active[selected_ids]]
             total_obstacle_failures += int(failed_attempts.numel())
             reset_attempt_state(failed_attempts)
@@ -400,9 +426,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         episode_shank_contact[done_env_ids] = 0.0
         episode_lin_vel_error[done_env_ids] = 0.0
         episode_ang_vel_error[done_env_ids] = 0.0
+        episode_reward_term_sums[done_env_ids] = 0.0
         if obstacle_metrics_enabled:
             episode_obstacle_attempts[done_env_ids] = 0
             episode_successful_crossings[done_env_ids] = 0
+            episode_direct_clear_successes[done_env_ids] = 0
+            episode_shank_hit_first_attempts[done_env_ids] = 0
+            episode_shank_hit_first_successes[done_env_ids] = 0
+            episode_top_step_first_attempts[done_env_ids] = 0
+            episode_top_step_first_successes[done_env_ids] = 0
             reset_attempt_state(done_env_ids)
 
     summary = {
@@ -432,15 +464,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "overall_crossing_success_rate": _safe_rate(total_obstacle_successes, total_obstacle_attempts),
                 "direct_clear_successes": total_direct_clear_successes,
                 "direct_clear_success_rate": _safe_rate(total_direct_clear_successes, total_obstacle_attempts),
-                "shank_hit_attempts": total_shank_hit_attempts,
-                "shank_hit_successes": total_shank_hit_successes,
-                "cross_after_shank_hit_rate": _safe_rate(total_shank_hit_successes, total_shank_hit_attempts),
+                "direct_clear_share_of_successes": _safe_rate(total_direct_clear_successes, total_obstacle_successes),
+                "shank_hit_first_attempts": total_shank_hit_first_attempts,
+                "shank_hit_then_cross_successes": total_shank_hit_first_successes,
+                "shank_hit_then_cross_rate": _safe_rate(
+                    total_shank_hit_first_successes, total_shank_hit_first_attempts
+                ),
+                "shank_hit_then_cross_share_of_attempts": _safe_rate(
+                    total_shank_hit_first_successes, total_obstacle_attempts
+                ),
+                "shank_hit_then_cross_share_of_successes": _safe_rate(
+                    total_shank_hit_first_successes, total_obstacle_successes
+                ),
                 "top_step_first_attempts": total_top_step_first_attempts,
-                "top_step_first_successes": total_top_step_first_successes,
+                "top_step_first_then_cross_successes": total_top_step_first_successes,
                 "top_step_first_then_cross_rate": _safe_rate(
                     total_top_step_first_successes, total_top_step_first_attempts
                 ),
-                "top_step_first_share_of_attempts": _safe_rate(
+                "top_step_first_then_cross_share_of_attempts": _safe_rate(
+                    total_top_step_first_successes, total_obstacle_attempts
+                ),
+                "top_step_first_then_cross_share_of_successes": _safe_rate(
+                    total_top_step_first_successes, total_obstacle_successes
+                ),
+                "top_step_first_attempt_share": _safe_rate(
                     total_top_step_first_attempts, total_obstacle_attempts
                 ),
                 "mean_obstacle_attempts_per_episode": _safe_mean(total_episode_obstacle_attempts, finished_episodes),
@@ -456,21 +503,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "top_step_height_fraction": top_step_height_fraction,
                     "top_step_min_height": top_step_min_height,
                     "top_step_max_height_above_obstacle": 0.08,
+                    "success_strategy_is_mutually_exclusive": True,
                     "strategy_definition": {
-                        "direct_clear": "Crossed after detecting an obstacle without shank hit and without a first landing on the obstacle top.",
-                        "shank_hit_then_cross": "Encounter had at least one shank collision before a successful crossing.",
-                        "top_step_first_then_cross": "The first decisive event was a foot first-contact on the obstacle top, and the robot later crossed successfully.",
+                        "direct_clear": "检测到障碍后成功越过，且第一次决定性事件既不是 shank 擦撞，也不是脚先踩上障碍顶面。",
+                        "shank_hit_then_cross": "第一次决定性事件是 shank 擦撞，之后仍然成功越过。",
+                        "top_step_first_then_cross": "第一次决定性事件是脚先踩上障碍顶面，之后仍然成功越过。",
+                    },
+                    "rate_definition": {
+                        "overall_crossing_success_rate": "successful_crossings / obstacle_attempts",
+                        "direct_clear_success_rate": "direct_clear_successes / obstacle_attempts",
+                        "shank_hit_then_cross_rate": "shank_hit_then_cross_successes / shank_hit_first_attempts",
+                        "top_step_first_then_cross_rate": "top_step_first_then_cross_successes / top_step_first_attempts",
                     },
                 },
             }
         )
 
-    for key in sorted(log_metric_totals):
-        mean_value = _safe_mean(log_metric_totals[key], finished_episodes)
-        if key.startswith("Episode_Reward/"):
-            summary["logged_reward_terms_per_second"][key.removeprefix("Episode_Reward/")] = mean_value
-        elif key.startswith("Episode_Termination/"):
-            summary["logged_termination_rates"][key.removeprefix("Episode_Termination/")] = mean_value
+    for reward_name in sorted(reward_names):
+        summary["logged_reward_terms_per_second"][reward_name] = _safe_mean(
+            reward_term_episode_means[reward_name], finished_episodes
+        )
+    for termination_name in sorted(termination_names):
+        summary["logged_termination_rates"][termination_name] = _safe_mean(
+            termination_term_totals[termination_name], finished_episodes
+        )
 
     print("[INFO] Evaluation summary:")
     print(json.dumps(summary, indent=2, sort_keys=True))

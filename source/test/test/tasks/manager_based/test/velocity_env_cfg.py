@@ -229,12 +229,12 @@ class EventCfg:
         interval 训练过程中周期性触发
     '''
     # 每 10~15 秒随机推一次机器人
-    push_robot = EventTerm(
-        func=mdp.push_by_setting_velocity,
-        mode="interval",
-        interval_range_s=(10.0, 15.0),
-        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
-    )
+    # push_robot = EventTerm(
+    #     func=mdp.push_by_setting_velocity,
+    #     mode="interval",
+    #     interval_range_s=(10.0, 15.0),
+    #     params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+    # )
 
 
 @configclass
@@ -255,7 +255,7 @@ class RewardsCfg:
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01) # 惩罚动作变化过快，鼓励平滑控制
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
-        weight=0.06,
+        weight=0.1,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
@@ -266,7 +266,7 @@ class RewardsCfg:
     foot_clearance = RewTerm(
         func=mdp.foot_clearance,
         # weight=0.075,
-        weight=0.05,
+        weight=0.1,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -278,9 +278,40 @@ class RewardsCfg:
             "look_ahead_distance": 0.6,
         },
     ) # 在摆动相奖励足端越过前方检测到的障碍高度，减少拖脚和无意义高抬腿
+    direct_clear_bonus = RewTerm(
+        func=mdp.direct_clear_bonus,
+        weight=2.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "air_time_threshold": 0.05,
+            "obstacle_threshold": 0.02,
+            "look_ahead_distance": 0.6,
+            "landing_margin": 0.05,
+        },
+    ) # 奖励摆动后第一次落脚直接落到障碍后方，鼓励“一步跨过”而不是踩顶通过
+    top_step_penalty = RewTerm(
+        func=mdp.top_step_penalty,
+        weight=-0.5,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "air_time_threshold": 0.05,
+            "obstacle_threshold": 0.02,
+            "look_ahead_distance": 0.6,
+            "top_step_height_fraction": 0.5,
+            "top_step_min_height": 0.02,
+            "top_step_max_height_above_obstacle": 0.08,
+            "x_margin": 0.02,
+        },
+    ) # 惩罚第一次落脚踩在障碍顶面，压制“先踩一下再过去”的局部最优
     stumble_penalty = RewTerm(
         func=mdp.stumble_penalty,
-        weight=-0.3,
+        weight=-1.0,
         # weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
@@ -292,20 +323,20 @@ class RewardsCfg:
     ) # 惩罚摆动相前摆脚撞到障碍，减少门槛前的绊脚和试探式乱蹭
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.5,
+        weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*THIGH"), "threshold": 1.0},
     ) # 惩罚不希望的接触，避免机器人与环境中的障碍物发生不必要的接触
     undesired_shank_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.25,
+        weight=-0.5,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*SHANK"), "threshold": 1.0},
     ) # 额外惩罚小腿擦碰障碍，避免只抬脚尖不抬小腿
    
     # -- optional penalties
     # 惩罚机身姿态偏离“水平”的程度
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.2)
     # 惩罚关节位置接近或超过关节极限
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-0.02)
 
 
 
