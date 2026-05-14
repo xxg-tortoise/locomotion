@@ -59,7 +59,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
@@ -101,11 +101,22 @@ def _compute_obstacle_scan_metrics(terrain_sensor, look_ahead_distance: float, o
         forward_ray_x.unsqueeze(0),
         torch.full((ray_hits_z.shape[0], forward_ray_x.numel()), float("inf"), device=ray_hits_z.device),
     )
-    nearest_obstacle_distance = masked_ray_x.min(dim=1).values
-    nearest_obstacle_distance = torch.where(
-        torch.isfinite(nearest_obstacle_distance),
-        nearest_obstacle_distance,
-        torch.zeros_like(nearest_obstacle_distance),
+    masked_ray_x_back = torch.where(
+        elevated_hits,
+        forward_ray_x.unsqueeze(0),
+        torch.full((ray_hits_z.shape[0], forward_ray_x.numel()), float("-inf"), device=ray_hits_z.device),
+    )
+    obstacle_front_distance = masked_ray_x.min(dim=1).values
+    obstacle_back_distance = masked_ray_x_back.max(dim=1).values
+    obstacle_front_distance = torch.where(
+        torch.isfinite(obstacle_front_distance),
+        obstacle_front_distance,
+        torch.zeros_like(obstacle_front_distance),
+    )
+    obstacle_back_distance = torch.where(
+        torch.isfinite(obstacle_back_distance),
+        obstacle_back_distance,
+        torch.zeros_like(obstacle_back_distance),
     )
 
     return {
@@ -113,8 +124,23 @@ def _compute_obstacle_scan_metrics(terrain_sensor, look_ahead_distance: float, o
         "obstacle_top_height": obstacle_top_height,
         "obstacle_height": obstacle_height,
         "obstacle_present": obstacle_present,
-        "nearest_obstacle_distance": nearest_obstacle_distance,
+        "nearest_obstacle_distance": obstacle_front_distance,
+        "obstacle_front_distance": obstacle_front_distance,
+        "obstacle_back_distance": obstacle_back_distance,
     }
+
+
+def _body_positions_in_base_yaw_frame(asset, body_ids) -> torch.Tensor:
+    """Convert body positions into the robot yaw-aligned base frame."""
+
+    body_pos_w = asset.data.body_pos_w[:, body_ids, :]
+    body_pos_rel_w = body_pos_w - asset.data.root_pos_w.unsqueeze(1)
+    body_count = body_pos_rel_w.shape[1]
+
+    base_yaw_quat = yaw_quat(asset.data.root_quat_w)
+    expanded_base_yaw_quat = base_yaw_quat.unsqueeze(1).expand(-1, body_count, -1).reshape(-1, 4)
+    body_pos_rel_b = quat_apply_inverse(expanded_base_yaw_quat, body_pos_rel_w.reshape(-1, 3))
+    return body_pos_rel_b.view(-1, body_count, 3)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -196,6 +222,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         obstacle_clear_steps_required = 3
         top_step_height_fraction = 0.5
         top_step_min_height = 0.02
+        top_step_air_time_threshold = 0.05
+        top_step_x_margin = 0.02
+        top_step_max_height_above_obstacle = 0.08
+        if "top_step_penalty" in reward_indices:
+            top_step_params = base_env.reward_manager.get_term_cfg("top_step_penalty").params
+            top_step_air_time_threshold = float(top_step_params.get("air_time_threshold", top_step_air_time_threshold))
+            top_step_x_margin = float(top_step_params.get("x_margin", top_step_x_margin))
+            top_step_max_height_above_obstacle = float(
+                top_step_params.get("top_step_max_height_above_obstacle", top_step_max_height_above_obstacle)
+            )
 
         attempt_active = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.bool)
         attempt_has_shank_hit = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.bool)
@@ -219,11 +255,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         total_obstacle_attempts = 0
         total_obstacle_successes = 0
         total_obstacle_failures = 0
+        total_obstacle_failures_time_out = 0
+        total_obstacle_failures_terminated = 0
         total_direct_clear_successes = 0
         total_shank_hit_first_attempts = 0
         total_shank_hit_first_successes = 0
         total_top_step_first_attempts = 0
         total_top_step_first_successes = 0
+        total_no_decisive_event_failures = 0
+        total_shank_hit_first_failures = 0
+        total_top_step_first_failures = 0
         total_episode_obstacle_attempts = 0
         total_episode_successful_crossings = 0
 
@@ -303,6 +344,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obstacle_top_height = obstacle_scan["obstacle_top_height"]
             reference_ground_height = obstacle_scan["reference_ground_height"]
             nearest_obstacle_distance = obstacle_scan["nearest_obstacle_distance"]
+            obstacle_front_distance = obstacle_scan["obstacle_front_distance"]
+            obstacle_back_distance = obstacle_scan["obstacle_back_distance"]
 
             moving_forward = command[:, 0] > forward_command_threshold
             new_attempts = (~attempt_active) & obstacle_present & moving_forward
@@ -324,16 +367,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             attempt_has_shank_hit |= attempt_active & shank_contact_now
 
             foot_first_contact = contact_sensor.compute_first_contact(base_env.step_dt)[:, foot_sensor_cfg.body_ids]
+            last_air_time = contact_sensor.data.last_air_time[:, foot_sensor_cfg.body_ids]
+            foot_pos_b = _body_positions_in_base_yaw_frame(robot, foot_asset_cfg.body_ids)
             foot_height = robot.data.body_pos_w[:, foot_asset_cfg.body_ids, 2]
             top_step_height_threshold = reference_ground_height.unsqueeze(1) + torch.maximum(
                 obstacle_height.unsqueeze(1) * top_step_height_fraction,
                 torch.full((base_env.num_envs, 1), top_step_min_height, device=base_env.device),
             )
+            moving = torch.norm(command[:, :2], dim=1, keepdim=True) > forward_command_threshold
+            foot_on_obstacle_span = (
+                foot_pos_b[:, :, 0] >= (obstacle_front_distance.unsqueeze(1) - top_step_x_margin)
+            ) & (
+                foot_pos_b[:, :, 0] <= (obstacle_back_distance.unsqueeze(1) + top_step_x_margin)
+            )
             foot_on_top_now = (
                 obstacle_present.unsqueeze(1)
+                & foot_on_obstacle_span
+                & moving
                 & foot_first_contact
+                & (last_air_time > top_step_air_time_threshold)
                 & (foot_height >= top_step_height_threshold)
-                & (foot_height <= obstacle_top_height.unsqueeze(1) + 0.08)
+                & (foot_height <= obstacle_top_height.unsqueeze(1) + top_step_max_height_above_obstacle)
             )
             top_step_now = torch.any(foot_on_top_now, dim=1)
 
@@ -408,7 +462,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # 走到 episode 结束仍未完成清障的 attempt，统一记为失败，
             # 且只统计本次真正纳入评估结果的 selected_ids，避免尾批次 spillover。
             failed_attempts = selected_ids[attempt_active[selected_ids]]
-            total_obstacle_failures += int(failed_attempts.numel())
+            num_failed_attempts = int(failed_attempts.numel())
+            total_obstacle_failures += num_failed_attempts
+            if num_failed_attempts > 0:
+                failed_time_outs = base_env.reset_time_outs[failed_attempts]
+                failed_terminated = base_env.reset_terminated[failed_attempts] & (~failed_time_outs)
+                total_obstacle_failures_time_out += int(failed_time_outs.sum().item())
+                total_obstacle_failures_terminated += int(failed_terminated.sum().item())
+
+                failed_strategies = attempt_strategy[failed_attempts]
+                total_no_decisive_event_failures += int((failed_strategies == 0).sum().item())
+                total_shank_hit_first_failures += int((failed_strategies == 1).sum().item())
+                total_top_step_first_failures += int((failed_strategies == 2).sum().item())
             reset_attempt_state(failed_attempts)
         previous_finished_episodes = finished_episodes
         finished_episodes += take
@@ -461,7 +526,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "obstacle_attempts": total_obstacle_attempts,
                 "successful_crossings": total_obstacle_successes,
                 "failed_crossings": total_obstacle_failures,
+                "failed_crossings_time_out": total_obstacle_failures_time_out,
+                "failed_crossings_terminated": total_obstacle_failures_terminated,
                 "overall_crossing_success_rate": _safe_rate(total_obstacle_successes, total_obstacle_attempts),
+                "overall_crossing_failure_rate": _safe_rate(total_obstacle_failures, total_obstacle_attempts),
                 "direct_clear_successes": total_direct_clear_successes,
                 "direct_clear_success_rate": _safe_rate(total_direct_clear_successes, total_obstacle_attempts),
                 "direct_clear_share_of_successes": _safe_rate(total_direct_clear_successes, total_obstacle_successes),
@@ -490,6 +558,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "top_step_first_attempt_share": _safe_rate(
                     total_top_step_first_attempts, total_obstacle_attempts
                 ),
+                "no_decisive_event_failures": total_no_decisive_event_failures,
+                "no_decisive_event_failure_rate": _safe_rate(
+                    total_no_decisive_event_failures, total_obstacle_attempts
+                ),
+                "shank_hit_first_failures": total_shank_hit_first_failures,
+                "shank_hit_first_failure_rate": _safe_rate(total_shank_hit_first_failures, total_obstacle_attempts),
+                "top_step_first_failures": total_top_step_first_failures,
+                "top_step_first_failure_rate": _safe_rate(total_top_step_first_failures, total_obstacle_attempts),
                 "mean_obstacle_attempts_per_episode": _safe_mean(total_episode_obstacle_attempts, finished_episodes),
                 "mean_successful_crossings_per_episode": _safe_mean(
                     total_episode_successful_crossings, finished_episodes
@@ -504,16 +580,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "top_step_min_height": top_step_min_height,
                     "top_step_max_height_above_obstacle": 0.08,
                     "success_strategy_is_mutually_exclusive": True,
-                    "strategy_definition": {
-                        "direct_clear": "检测到障碍后成功越过，且第一次决定性事件既不是 shank 擦撞，也不是脚先踩上障碍顶面。",
-                        "shank_hit_then_cross": "第一次决定性事件是 shank 擦撞，之后仍然成功越过。",
-                        "top_step_first_then_cross": "第一次决定性事件是脚先踩上障碍顶面，之后仍然成功越过。",
-                    },
+                    # "strategy_definition": {
+                    #     "direct_clear": "检测到障碍后成功越过，且第一次决定性事件既不是 shank 擦撞，也不是脚先踩上障碍顶面。",
+                    #     "shank_hit_then_cross": "第一次决定性事件是 shank 擦撞，之后仍然成功越过。",
+                    #     "top_step_first_then_cross": "第一次决定性事件是脚先踩上障碍顶面，之后仍然成功越过。",
+                    # },
+                    # "failure_definition": {
+                    #     "failed_crossing": "障碍尝试已开始，但在 episode 结束前未满足成功越障判据。",
+                    #     "failed_crossings_time_out": "失败尝试对应的 episode 由 time_out 结束。",
+                    #     "failed_crossings_terminated": "失败尝试对应的 episode 由非 time_out 终止（如非法接触）结束。",
+                    #     "no_decisive_event_failure": "失败前未记录到 shank 首次擦撞，也未记录到 top-step 首次事件。",
+                    #     "shank_hit_first_failure": "失败前第一次决定性事件为 shank 擦撞。",
+                    #     "top_step_first_failure": "失败前第一次决定性事件为脚先踩上障碍顶面。",
+                    # },
                     "rate_definition": {
                         "overall_crossing_success_rate": "successful_crossings / obstacle_attempts",
+                        "overall_crossing_failure_rate": "failed_crossings / obstacle_attempts",
                         "direct_clear_success_rate": "direct_clear_successes / obstacle_attempts",
                         "shank_hit_then_cross_rate": "shank_hit_then_cross_successes / shank_hit_first_attempts",
                         "top_step_first_then_cross_rate": "top_step_first_then_cross_successes / top_step_first_attempts",
+                        "no_decisive_event_failure_rate": "no_decisive_event_failures / obstacle_attempts",
+                        "shank_hit_first_failure_rate": "shank_hit_first_failures / obstacle_attempts",
+                        "top_step_first_failure_rate": "top_step_first_failures / obstacle_attempts",
                     },
                 },
             }

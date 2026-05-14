@@ -242,31 +242,29 @@ class RewardsCfg:
 
     # -- task
     track_lin_vel_xy_exp = RewTerm( 
-        func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+        func=mdp.track_lin_vel_xy_exp, weight=0.9, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     ) # 鼓励机器人跟踪指令里的平面线速度
     track_ang_vel_z_exp = RewTerm( 
-        func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+        func=mdp.track_ang_vel_z_exp, weight=0.45, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
     ) # 鼓励跟踪指令里的偏航角速度
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0) # 惩罚竖直方向速度，避免上下
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05) # 惩罚 roll/pitch 角速度，避免机身晃动过大
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.08) # 进一步压制 roll/pitch 角速度，减小越障前后的机身晃动
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5) #惩罚关节力矩过大，降低能耗/暴力控制
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7) # 惩罚关节加速度过大，减少冲击
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01) # 惩罚动作变化过快，鼓励平滑控制
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.02) # 进一步加强动作平滑约束，抑制突然前甩腿
     feet_air_time = RewTerm(
         func=mdp.feet_air_time,
-        weight=0.1,
+        weight=0.06,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
-            "threshold": 0.4,
-            # "threshold": 0.5,
+            "threshold": 0.3,
         },
-    ) # 鼓励足部有一定的空中时间，避免一直贴地滑行
+    ) # 保留一定步态弹性，但不再过度推动长 swing 和提前送腿
     foot_clearance = RewTerm(
         func=mdp.foot_clearance,
-        # weight=0.075,
-        weight=0.1,
+        weight=0.04,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -276,11 +274,13 @@ class RewardsCfg:
             "std": 0.05,
             "obstacle_threshold": 0.02,
             "look_ahead_distance": 0.6,
+            "reward_activation_far_distance": 0.32,
+            "reward_activation_near_distance": 0.18,
         },
-    ) # 在摆动相奖励足端越过前方检测到的障碍高度，减少拖脚和无意义高抬腿
+    ) # 只在障碍真正靠近时奖励抬脚，避免远距离就开始明显探腿
     direct_clear_bonus = RewTerm(
         func=mdp.direct_clear_bonus,
-        weight=2.0,
+        weight=5.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -289,12 +289,37 @@ class RewardsCfg:
             "air_time_threshold": 0.05,
             "obstacle_threshold": 0.02,
             "look_ahead_distance": 0.6,
-            "landing_margin": 0.05,
+            "reward_activation_far_distance": 0.32,
+            "reward_activation_near_distance": 0.18,
+            "landing_target_margin": 0.03,
+            "min_landing_margin": 0.01,
+            "landing_target_std": 0.05,
+            "top_step_height_fraction": 0.5,
+            "top_step_min_height": 0.02,
+            "top_step_max_height_above_obstacle": 0.08,
+            "x_margin": 0.02,
         },
-    ) # 奖励摆动后第一次落脚直接落到障碍后方，鼓励“一步跨过”而不是踩顶通过
+    ) # 奖励近障碍阶段的第一落点直接落在障碍后方附近，明确鼓励 direct clear
+    premature_foot_reach_penalty = RewTerm(
+        func=mdp.premature_foot_reach_penalty,
+        weight=-0.6,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "obstacle_threshold": 0.02,
+            "look_ahead_distance": 0.6,
+            "reward_activation_far_distance": 0.32,
+            "reward_activation_near_distance": 0.18,
+            "base_allowed_forward_x": 0.12,
+            "max_allowed_forward_x": 0.27,
+            "forward_slack_gain": 1.0,
+        },
+    ) # 惩罚障碍还较远时摆动脚过早前送，压制“腿总想先伸出去”的趋势
     top_step_penalty = RewTerm(
         func=mdp.top_step_penalty,
-        weight=-0.5,
+        weight=-4.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -308,11 +333,27 @@ class RewardsCfg:
             "top_step_max_height_above_obstacle": 0.08,
             "x_margin": 0.02,
         },
-    ) # 惩罚第一次落脚踩在障碍顶面，压制“先踩一下再过去”的局部最优
+    ) # 明确打击第一次落脚踩顶的策略，让“踩一下再过去”不再便宜
+    top_surface_stance_penalty = RewTerm(
+        func=mdp.top_surface_stance_penalty,
+        weight=-0.3,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*FOOT"),
+            "command_name": "base_velocity",
+            "obstacle_threshold": 0.02,
+            "look_ahead_distance": 0.6,
+            "top_step_height_fraction": 0.5,
+            "top_step_min_height": 0.02,
+            "top_step_max_height_above_obstacle": 0.08,
+            "x_margin": 0.02,
+            "contact_force_threshold": 1.0,
+        },
+    ) # 对障碍顶面驻留施加持续惩罚，进一步压制先踩顶再过
     stumble_penalty = RewTerm(
         func=mdp.stumble_penalty,
-        weight=-1.0,
-        # weight=-0.5,
+        weight=-2.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*FOOT"),
             "command_name": "base_velocity",
@@ -320,7 +361,7 @@ class RewardsCfg:
             "horizontal_to_vertical_ratio": 4.0,
             "air_time_threshold": 0.05,
         },
-    ) # 惩罚摆动相前摆脚撞到障碍，减少门槛前的绊脚和试探式乱蹭
+    ) # 加强对摆动脚撞障碍的惩罚，避免靠磕碰把脚“带过去”
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -328,9 +369,9 @@ class RewardsCfg:
     ) # 惩罚不希望的接触，避免机器人与环境中的障碍物发生不必要的接触
     undesired_shank_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.5,
+        weight=-1.5,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*SHANK"), "threshold": 1.0},
-    ) # 额外惩罚小腿擦碰障碍，避免只抬脚尖不抬小腿
+    ) # 提高小腿擦碰代价，避免先伸小腿去蹭再把脚送过去
    
     # -- optional penalties
     # 惩罚机身姿态偏离“水平”的程度

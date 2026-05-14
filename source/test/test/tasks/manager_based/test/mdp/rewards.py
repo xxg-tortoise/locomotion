@@ -58,6 +58,25 @@ def _compute_forward_obstacle_stats(
     }
 
 
+def _compute_obstacle_proximity_weight(
+    obstacle_front_distance: torch.Tensor,
+    obstacle_present: torch.Tensor,
+    activation_far_distance: float,
+    activation_near_distance: float,
+) -> torch.Tensor:
+    """根据障碍前缘距离生成一个平滑接近权重，避免奖励过早激活。"""
+
+    if activation_near_distance >= activation_far_distance:
+        raise ValueError(
+            "activation_near_distance 必须小于 activation_far_distance，"
+            f"但收到 {activation_near_distance} >= {activation_far_distance}。"
+        )
+
+    ramp = (activation_far_distance - obstacle_front_distance) / (activation_far_distance - activation_near_distance)
+    ramp = torch.clamp(ramp, min=0.0, max=1.0)
+    return ramp * obstacle_present.float()
+
+
 def _body_positions_in_base_yaw_frame(asset, body_ids) -> torch.Tensor:
     """将指定刚体的位置转换到机身 yaw 对齐坐标系。"""
 
@@ -69,6 +88,42 @@ def _body_positions_in_base_yaw_frame(asset, body_ids) -> torch.Tensor:
     expanded_base_yaw_quat = base_yaw_quat.unsqueeze(1).expand(-1, body_count, -1).reshape(-1, 4)
     body_pos_rel_b = quat_apply_inverse(expanded_base_yaw_quat, body_pos_rel_w.reshape(-1, 3))
     return body_pos_rel_b.view(-1, body_count, 3)
+
+
+def _compute_swing_landing_and_top_step_mask(
+    obstacle_stats: dict[str, torch.Tensor],
+    foot_pos_b: torch.Tensor,
+    foot_height: torch.Tensor,
+    first_contact: torch.Tensor,
+    last_air_time: torch.Tensor,
+    moving: torch.Tensor,
+    air_time_threshold: float,
+    top_step_height_fraction: float,
+    top_step_min_height: float,
+    top_step_max_height_above_obstacle: float,
+    x_margin: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """计算摆动落脚事件以及“脚先踩到障碍顶面”的掩码。"""
+
+    swing_landing = first_contact & (last_air_time > air_time_threshold)
+    top_step_height_threshold = obstacle_stats["reference_ground_height"] + torch.maximum(
+        obstacle_stats["obstacle_height"] * top_step_height_fraction,
+        torch.full_like(obstacle_stats["obstacle_height"], top_step_min_height),
+    )
+    foot_on_obstacle_span = (
+        foot_pos_b[:, :, 0] >= (obstacle_stats["obstacle_front_distance"].unsqueeze(1) - x_margin)
+    ) & (
+        foot_pos_b[:, :, 0] <= (obstacle_stats["obstacle_back_distance"].unsqueeze(1) + x_margin)
+    )
+    foot_on_top = (
+        swing_landing
+        & moving
+        & obstacle_stats["obstacle_present"].unsqueeze(1)
+        & foot_on_obstacle_span
+        & (foot_height >= top_step_height_threshold)
+        & (foot_height <= obstacle_stats["obstacle_top_height"] + top_step_max_height_above_obstacle)
+    )
+    return swing_landing, foot_on_top
 
 
 def feet_air_time(
@@ -111,6 +166,8 @@ def foot_clearance(
     command_threshold: float = 0.1,  # 速度门槛。当平面速度指令的模长低于这个值时，这项奖励直接清零，防止静止时也被鼓励抬脚。
     obstacle_threshold: float = 0.02, # 小凸起要不要触发抬脚奖励
     look_ahead_distance: float = 0.6,  # 只看前方多远的障碍
+    reward_activation_far_distance: float = 0.32,  # 障碍前缘还在这个距离之外时，不提前激活抬脚奖励
+    reward_activation_near_distance: float = 0.18,  # 障碍靠近到这个距离内时，抬脚奖励完全激活
 ) -> torch.Tensor:
     """
         在摆动相奖励足端越过前方扫描到的最高障碍，并额外留出一点安全裕量
@@ -130,14 +187,18 @@ def foot_clearance(
         obstacle_threshold=obstacle_threshold,
     )
     obstacle_top_height = obstacle_stats["obstacle_top_height"]
-    obstacle_height = obstacle_stats["obstacle_height"]
     target_height = obstacle_top_height + clearance_margin
+    proximity_weight = _compute_obstacle_proximity_weight(
+        obstacle_stats["obstacle_front_distance"],
+        obstacle_stats["obstacle_present"],
+        activation_far_distance=reward_activation_far_distance,
+        activation_near_distance=reward_activation_near_distance,
+    )
 
     clearance_error = torch.square(foot_height - target_height)
     reward = torch.sum(torch.exp(-clearance_error / std**2) * in_air, dim=1)
     moving = torch.norm(command[:, :2], dim=1) > command_threshold
-    obstacle_present = obstacle_stats["obstacle_present"]
-    reward *= (moving & obstacle_present).float()
+    reward *= moving.float() * proximity_weight
     return reward
 
 
@@ -151,7 +212,15 @@ def direct_clear_bonus(
     air_time_threshold: float = 0.05,
     obstacle_threshold: float = 0.02,
     look_ahead_distance: float = 0.6,
-    landing_margin: float = 0.05,
+    reward_activation_far_distance: float = 0.32,
+    reward_activation_near_distance: float = 0.18,
+    landing_target_margin: float = 0.03,
+    min_landing_margin: float = 0.01,
+    landing_target_std: float = 0.05,
+    top_step_height_fraction: float = 0.5,
+    top_step_min_height: float = 0.02,
+    top_step_max_height_above_obstacle: float = 0.08,
+    x_margin: float = 0.02,
 ) -> torch.Tensor:
     """
         奖励摆动相后的第一次落脚直接落到障碍后方，而不是先踩在障碍顶面。
@@ -168,21 +237,102 @@ def direct_clear_bonus(
         obstacle_threshold=obstacle_threshold,
     )
     foot_pos_b = _body_positions_in_base_yaw_frame(asset, asset_cfg.body_ids)
+    foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
     first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
     last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
 
     moving = torch.norm(command[:, :2], dim=1, keepdim=True) > command_threshold
-    swing_landing = first_contact & (last_air_time > air_time_threshold)
+    proximity_weight = _compute_obstacle_proximity_weight(
+        obstacle_stats["obstacle_front_distance"],
+        obstacle_stats["obstacle_present"],
+        activation_far_distance=reward_activation_far_distance,
+        activation_near_distance=reward_activation_near_distance,
+    )
+    swing_landing, foot_on_top = _compute_swing_landing_and_top_step_mask(
+        obstacle_stats=obstacle_stats,
+        foot_pos_b=foot_pos_b,
+        foot_height=foot_height,
+        first_contact=first_contact,
+        last_air_time=last_air_time,
+        moving=moving,
+        air_time_threshold=air_time_threshold,
+        top_step_height_fraction=top_step_height_fraction,
+        top_step_min_height=top_step_min_height,
+        top_step_max_height_above_obstacle=top_step_max_height_above_obstacle,
+        x_margin=x_margin,
+    )
+
+    landing_target_x = obstacle_stats["obstacle_back_distance"].unsqueeze(1) + landing_target_margin
+    landing_error = torch.square(foot_pos_b[:, :, 0] - landing_target_x)
+    landing_quality = torch.exp(-landing_error / landing_target_std**2)
     landing_beyond_obstacle = foot_pos_b[:, :, 0] >= (
-        obstacle_stats["obstacle_back_distance"].unsqueeze(1) + landing_margin
+        obstacle_stats["obstacle_back_distance"].unsqueeze(1) + min_landing_margin
     )
-    direct_clear_event = (
-        swing_landing
-        & moving
-        & obstacle_stats["obstacle_present"].unsqueeze(1)
-        & landing_beyond_obstacle
+    reward = (
+        landing_quality
+        * swing_landing.float()
+        * (~foot_on_top).float()
+        * landing_beyond_obstacle.float()
+        * moving.float()
+        * proximity_weight.unsqueeze(1)
     )
-    return torch.any(direct_clear_event, dim=1).float()
+    return torch.max(reward, dim=1).values
+
+
+def premature_foot_reach_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    terrain_sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_threshold: float = 0.1,
+    obstacle_threshold: float = 0.02,
+    look_ahead_distance: float = 0.6,
+    reward_activation_far_distance: float = 0.32,
+    reward_activation_near_distance: float = 0.18,
+    base_allowed_forward_x: float = 0.14,
+    max_allowed_forward_x: float = 0.30,
+    forward_slack_gain: float = 1.0,
+) -> torch.Tensor:
+    """
+        惩罚障碍还较远时摆动脚过早大幅前伸，避免腿总想提前去够门槛。
+    """
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    terrain_sensor: RayCaster = env.scene.sensors[terrain_sensor_cfg.name]
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    obstacle_stats = _compute_forward_obstacle_stats(
+        terrain_sensor,
+        look_ahead_distance=look_ahead_distance,
+        obstacle_threshold=obstacle_threshold,
+    )
+    proximity_weight = _compute_obstacle_proximity_weight(
+        obstacle_stats["obstacle_front_distance"],
+        obstacle_stats["obstacle_present"],
+        activation_far_distance=reward_activation_far_distance,
+        activation_near_distance=reward_activation_near_distance,
+    )
+    early_reach_weight = obstacle_stats["obstacle_present"].float() * (1.0 - proximity_weight)
+    foot_pos_b = _body_positions_in_base_yaw_frame(asset, asset_cfg.body_ids)
+    in_air = (contact_sensor.data.current_air_time[:, sensor_cfg.body_ids] > 0.0).float()
+    moving = (torch.norm(command[:, :2], dim=1, keepdim=True) > command_threshold).float()
+
+    allowed_forward_reach = base_allowed_forward_x + forward_slack_gain * torch.clamp(
+        reward_activation_far_distance - obstacle_stats["obstacle_front_distance"],
+        min=0.0,
+    )
+    allowed_forward_reach = torch.clamp(allowed_forward_reach, max=max_allowed_forward_x)
+    excess_reach = torch.clamp(foot_pos_b[:, :, 0] - allowed_forward_reach.unsqueeze(1), min=0.0)
+
+    penalty = (
+        excess_reach.square()
+        * in_air
+        * moving
+        * early_reach_weight.unsqueeze(1)
+    )
+    return torch.max(penalty, dim=1).values
 
 
 def top_step_penalty(
@@ -220,7 +370,58 @@ def top_step_penalty(
     last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
 
     moving = torch.norm(command[:, :2], dim=1, keepdim=True) > command_threshold
-    swing_landing = first_contact & (last_air_time > air_time_threshold)
+    _, foot_on_top = _compute_swing_landing_and_top_step_mask(
+        obstacle_stats=obstacle_stats,
+        foot_pos_b=foot_pos_b,
+        foot_height=foot_height,
+        first_contact=first_contact,
+        last_air_time=last_air_time,
+        moving=moving,
+        air_time_threshold=air_time_threshold,
+        top_step_height_fraction=top_step_height_fraction,
+        top_step_min_height=top_step_min_height,
+        top_step_max_height_above_obstacle=top_step_max_height_above_obstacle,
+        x_margin=x_margin,
+    )
+    return torch.any(foot_on_top, dim=1).float()
+
+
+def top_surface_stance_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    terrain_sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_threshold: float = 0.1,
+    obstacle_threshold: float = 0.02,
+    look_ahead_distance: float = 0.6,
+    top_step_height_fraction: float = 0.5,
+    top_step_min_height: float = 0.02,
+    top_step_max_height_above_obstacle: float = 0.08,
+    x_margin: float = 0.02,
+    contact_force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """
+        惩罚脚在障碍顶面上的驻留接触，降低“先踩顶再过”的整体收益。
+    """
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    terrain_sensor: RayCaster = env.scene.sensors[terrain_sensor_cfg.name]
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    obstacle_stats = _compute_forward_obstacle_stats(
+        terrain_sensor,
+        look_ahead_distance=look_ahead_distance,
+        obstacle_threshold=obstacle_threshold,
+    )
+    foot_pos_b = _body_positions_in_base_yaw_frame(asset, asset_cfg.body_ids)
+    foot_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+
+    contact_forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(contact_forces, dim=-1).max(dim=1)[0] > contact_force_threshold
+    moving = torch.norm(command[:, :2], dim=1, keepdim=True) > command_threshold
+
     top_step_height_threshold = obstacle_stats["reference_ground_height"] + torch.maximum(
         obstacle_stats["obstacle_height"] * top_step_height_fraction,
         torch.full_like(obstacle_stats["obstacle_height"], top_step_min_height),
@@ -230,15 +431,15 @@ def top_step_penalty(
     ) & (
         foot_pos_b[:, :, 0] <= (obstacle_stats["obstacle_back_distance"].unsqueeze(1) + x_margin)
     )
-    foot_on_top = (
-        swing_landing
+    foot_on_top_stance = (
+        in_contact
         & moving
         & obstacle_stats["obstacle_present"].unsqueeze(1)
         & foot_on_obstacle_span
         & (foot_height >= top_step_height_threshold)
         & (foot_height <= obstacle_stats["obstacle_top_height"] + top_step_max_height_above_obstacle)
     )
-    return torch.any(foot_on_top, dim=1).float()
+    return torch.sum(foot_on_top_stance.float(), dim=1)
 
 
 def stumble_penalty(
